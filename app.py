@@ -5,12 +5,12 @@ from typing import List
 
 import numpy as np
 import torch
-import torchvision.models as tv_models
 from PIL import Image, ImageOps
 from fastapi import FastAPI, File, UploadFile, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 
 import mediapipe as mp
+from transformers import AutoImageProcessor, MobileNetV2ForImageClassification
 
 BaseOptions = mp.tasks.BaseOptions
 FaceDetector = mp.tasks.vision.FaceDetector
@@ -28,8 +28,9 @@ app.add_middleware(
 )
 
 # ---------------------------------------------------------------------------
-# Model files are downloaded once on first request and cached on disk for
-# the lifetime of the Render instance. Nothing needs to be bundled by hand.
+# Face detector model file is downloaded once and cached on disk. The beauty
+# classifier is loaded via the transformers library, which downloads its own
+# weights + matched config the first time it's used and caches them too.
 # ---------------------------------------------------------------------------
 CACHE_DIR = "model_cache"
 
@@ -39,15 +40,24 @@ FACE_DETECTOR_URL = (
 )
 FACE_DETECTOR_PATH = os.path.join(CACHE_DIR, "blaze_face_short_range.tflite")
 
-BEAUTY_MODEL_URL = (
-    "https://huggingface.co/Gustrd/SCUT-FBP5500-PyTorch-Model/"
-    "resolve/main/resnet18_py3.pth"
-)
-BEAUTY_MODEL_PATH = os.path.join(CACHE_DIR, "resnet18_py3.pth")
+BEAUTY_MODEL_REPO = "Aruno/gemini-beauty"
 
-_beauty_model = None
+# Maps this model's class labels to a 1-5 beauty value. Read dynamically
+# from the model's own config.id2label at load time rather than assuming a
+# fixed index order.
+LABEL_VALUES = {
+    "very_ugly": 1.0,
+    "very ugly": 1.0,
+    "ugly": 2.0,
+    "normal": 3.0,
+    "attractive": 4.0,
+    "very_attractive": 5.0,
+    "very attractive": 5.0,
+}
+
 _face_detector = None
-_beauty_model_load_issues: dict = {}
+_beauty_model = None
+_beauty_processor = None
 
 
 def _ensure_cached(url: str, path: str):
@@ -70,42 +80,12 @@ def get_face_detector():
 
 
 def get_beauty_model():
-    global _beauty_model
+    global _beauty_model, _beauty_processor
     if _beauty_model is None:
-        _ensure_cached(BEAUTY_MODEL_URL, BEAUTY_MODEL_PATH)
-        m = tv_models.resnet18(num_classes=1)
-        checkpoint = torch.load(BEAUTY_MODEL_PATH, map_location="cpu")
-
-        # This particular checkpoint wraps the real weights inside a
-        # "state_dict" key alongside training metadata (epoch, optimizer,
-        # best_prec1) rather than being a plain weights file.
-        if isinstance(checkpoint, dict) and "state_dict" in checkpoint:
-            state_dict = checkpoint["state_dict"]
-        else:
-            state_dict = checkpoint
-
-        # Strip the "module." prefix left behind from training with
-        # nn.DataParallel, if present.
-        cleaned = {}
-        for k, v in state_dict.items():
-            new_k = k[len("module."):] if k.startswith("module.") else k
-            cleaned[new_k] = v
-
-        load_result = m.load_state_dict(cleaned, strict=False)
-        if load_result.missing_keys or load_result.unexpected_keys:
-            # Surface this loudly rather than silently using a half-loaded
-            # model — /debug_models will show it on the next check.
-            _beauty_model_load_issues["missing_keys"] = load_result.missing_keys
-            _beauty_model_load_issues["unexpected_keys"] = load_result.unexpected_keys
-
-        m.eval()
-        _beauty_model = m
-    return _beauty_model
-
-
-FACE_INPUT_SIZE = 224
-IMAGENET_MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)
-IMAGENET_STD = np.array([0.229, 0.224, 0.225], dtype=np.float32)
+        _beauty_processor = AutoImageProcessor.from_pretrained(BEAUTY_MODEL_REPO)
+        _beauty_model = MobileNetV2ForImageClassification.from_pretrained(BEAUTY_MODEL_REPO)
+        _beauty_model.eval()
+    return _beauty_model, _beauty_processor
 
 
 def _crop_face(pil_img: Image.Image, bbox) -> Image.Image:
@@ -121,12 +101,32 @@ def _crop_face(pil_img: Image.Image, bbox) -> Image.Image:
     return pil_img.crop((left, top, right, bottom)).convert("RGB")
 
 
-def _face_to_tensor(face_img: Image.Image) -> torch.Tensor:
-    face_img = face_img.resize((FACE_INPUT_SIZE, FACE_INPUT_SIZE))
-    arr = np.asarray(face_img).astype(np.float32) / 255.0
-    arr = (arr - IMAGENET_MEAN) / IMAGENET_STD
-    arr = arr.transpose(2, 0, 1)  # HWC -> CHW
-    return torch.from_numpy(arr).unsqueeze(0)
+def _score_face_crop(face_img: Image.Image) -> float:
+    """Returns a 1-5 beauty value from the classifier's class probabilities."""
+    model, processor = get_beauty_model()
+
+    inputs = processor(images=face_img, return_tensors="pt")
+    with torch.no_grad():
+        logits = model(**inputs).logits[0]
+    probs = torch.softmax(logits, dim=0).tolist()
+
+    id2label = model.config.id2label
+
+    total = 0.0
+    weight_sum = 0.0
+    for idx, prob in enumerate(probs):
+        raw_label = id2label.get(idx) or id2label.get(str(idx)) or ""
+        key = raw_label.strip().lower()
+        value = LABEL_VALUES.get(key) or LABEL_VALUES.get(key.replace(" ", "_"))
+        if value is None:
+            continue
+        total += prob * value
+        weight_sum += prob
+
+    if weight_sum <= 0:
+        raise RuntimeError(f"No recognized labels in model.config.id2label: {id2label}")
+
+    return total / weight_sum
 
 
 def score_one_image(image_bytes: bytes):
@@ -157,15 +157,10 @@ def score_one_image(image_bytes: bytes):
     )
 
     face_img = _crop_face(pil_img, best.bounding_box)
-    tensor = _face_to_tensor(face_img)
 
-    model = get_beauty_model()
-    with torch.no_grad():
-        raw = model(tensor).item()
-
-    # SCUT-FBP5500 beauty ratings are on a ~1-5 scale
-    raw = max(1.0, min(5.0, raw))
-    score_0_100 = (raw - 1.0) / 4.0 * 100.0
+    raw_1_5 = _score_face_crop(face_img)
+    raw_1_5 = max(1.0, min(5.0, raw_1_5))
+    score_0_100 = (raw_1_5 - 1.0) / 4.0 * 100.0
     return score_0_100, diag
 
 
@@ -176,8 +171,6 @@ def health():
 
 @app.get("/debug_models")
 def debug_models():
-    # Confirms the model files actually downloaded (and how big they are),
-    # without needing to score anything.
     info = {}
     try:
         get_face_detector()
@@ -187,22 +180,17 @@ def debug_models():
         info["face_detector_error"] = f"{type(e).__name__}: {e}"
 
     try:
-        get_beauty_model()
+        model, _ = get_beauty_model()
         info["beauty_model_loaded"] = True
-        if _beauty_model_load_issues:
-            info["beauty_model_load_issues"] = _beauty_model_load_issues
+        info["beauty_model_labels"] = model.config.id2label
     except Exception as e:
         info["beauty_model_loaded"] = False
         info["beauty_model_error"] = f"{type(e).__name__}: {e}"
 
-    for name, path in [
-        ("face_detector_file", FACE_DETECTOR_PATH),
-        ("beauty_model_file", BEAUTY_MODEL_PATH),
-    ]:
-        if os.path.exists(path):
-            info[name] = {"exists": True, "bytes": os.path.getsize(path)}
-        else:
-            info[name] = {"exists": False}
+    if os.path.exists(FACE_DETECTOR_PATH):
+        info["face_detector_file"] = {"exists": True, "bytes": os.path.getsize(FACE_DETECTOR_PATH)}
+    else:
+        info["face_detector_file"] = {"exists": False}
 
     return info
 
