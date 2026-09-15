@@ -6,7 +6,7 @@ from typing import List
 import numpy as np
 import torch
 import torchvision.models as tv_models
-from PIL import Image
+from PIL import Image, ImageOps
 from fastapi import FastAPI, File, UploadFile, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 
@@ -107,7 +107,12 @@ def _face_to_tensor(face_img: Image.Image) -> torch.Tensor:
 
 
 def score_one_image(image_bytes: bytes):
-    pil_img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+    pil_img = Image.open(io.BytesIO(image_bytes))
+    # Phone photos carry an EXIF rotation tag rather than storing pixels
+    # already rotated — without this, a sideways/upside-down image gets fed
+    # straight to the face detector and no face is found.
+    pil_img = ImageOps.exif_transpose(pil_img)
+    pil_img = pil_img.convert("RGB")
     np_img = np.array(pil_img)
 
     mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=np_img)
