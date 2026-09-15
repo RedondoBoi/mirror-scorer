@@ -47,6 +47,7 @@ BEAUTY_MODEL_PATH = os.path.join(CACHE_DIR, "resnet18_py3.pth")
 
 _beauty_model = None
 _face_detector = None
+_beauty_model_load_issues: dict = {}
 
 
 def _ensure_cached(url: str, path: str):
@@ -73,8 +74,30 @@ def get_beauty_model():
     if _beauty_model is None:
         _ensure_cached(BEAUTY_MODEL_URL, BEAUTY_MODEL_PATH)
         m = tv_models.resnet18(num_classes=1)
-        state_dict = torch.load(BEAUTY_MODEL_PATH, map_location="cpu")
-        m.load_state_dict(state_dict)
+        checkpoint = torch.load(BEAUTY_MODEL_PATH, map_location="cpu")
+
+        # This particular checkpoint wraps the real weights inside a
+        # "state_dict" key alongside training metadata (epoch, optimizer,
+        # best_prec1) rather than being a plain weights file.
+        if isinstance(checkpoint, dict) and "state_dict" in checkpoint:
+            state_dict = checkpoint["state_dict"]
+        else:
+            state_dict = checkpoint
+
+        # Strip the "module." prefix left behind from training with
+        # nn.DataParallel, if present.
+        cleaned = {}
+        for k, v in state_dict.items():
+            new_k = k[len("module."):] if k.startswith("module.") else k
+            cleaned[new_k] = v
+
+        load_result = m.load_state_dict(cleaned, strict=False)
+        if load_result.missing_keys or load_result.unexpected_keys:
+            # Surface this loudly rather than silently using a half-loaded
+            # model — /debug_models will show it on the next check.
+            _beauty_model_load_issues["missing_keys"] = load_result.missing_keys
+            _beauty_model_load_issues["unexpected_keys"] = load_result.unexpected_keys
+
         m.eval()
         _beauty_model = m
     return _beauty_model
@@ -166,6 +189,8 @@ def debug_models():
     try:
         get_beauty_model()
         info["beauty_model_loaded"] = True
+        if _beauty_model_load_issues:
+            info["beauty_model_load_issues"] = _beauty_model_load_issues
     except Exception as e:
         info["beauty_model_loaded"] = False
         info["beauty_model_error"] = f"{type(e).__name__}: {e}"
