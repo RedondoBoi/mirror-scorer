@@ -113,15 +113,19 @@ def score_one_image(image_bytes: bytes):
     # straight to the face detector and no face is found.
     pil_img = ImageOps.exif_transpose(pil_img)
     pil_img = pil_img.convert("RGB")
-    np_img = np.array(pil_img)
+    np_img = np.ascontiguousarray(np.array(pil_img))
+
+    diag = {"width": pil_img.width, "height": pil_img.height}
 
     mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=np_img)
 
     detector = get_face_detector()
     result = detector.detect(mp_image)
 
+    diag["num_detections"] = len(result.detections) if result.detections else 0
+
     if not result.detections:
-        return None
+        return None, diag
 
     # use the largest detected face, in case more than one face is in frame
     best = max(
@@ -139,12 +143,43 @@ def score_one_image(image_bytes: bytes):
     # SCUT-FBP5500 beauty ratings are on a ~1-5 scale
     raw = max(1.0, min(5.0, raw))
     score_0_100 = (raw - 1.0) / 4.0 * 100.0
-    return score_0_100
+    return score_0_100, diag
 
 
 @app.get("/health")
 def health():
     return {"ok": True}
+
+
+@app.get("/debug_models")
+def debug_models():
+    # Confirms the model files actually downloaded (and how big they are),
+    # without needing to score anything.
+    info = {}
+    try:
+        get_face_detector()
+        info["face_detector_loaded"] = True
+    except Exception as e:
+        info["face_detector_loaded"] = False
+        info["face_detector_error"] = f"{type(e).__name__}: {e}"
+
+    try:
+        get_beauty_model()
+        info["beauty_model_loaded"] = True
+    except Exception as e:
+        info["beauty_model_loaded"] = False
+        info["beauty_model_error"] = f"{type(e).__name__}: {e}"
+
+    for name, path in [
+        ("face_detector_file", FACE_DETECTOR_PATH),
+        ("beauty_model_file", BEAUTY_MODEL_PATH),
+    ]:
+        if os.path.exists(path):
+            info[name] = {"exists": True, "bytes": os.path.getsize(path)}
+        else:
+            info[name] = {"exists": False}
+
+    return info
 
 
 @app.post("/score_upload")
@@ -154,25 +189,34 @@ async def score_upload(photos: List[UploadFile] = File(...)):
 
     scores: List[float] = []
     skipped = 0
+    per_photo_debug = []
 
-    for photo in photos:
+    for i, photo in enumerate(photos):
         content = await photo.read()
         if not content or len(content) < 500:
             skipped += 1
+            per_photo_debug.append({"photo": i, "error": "file_too_small", "bytes": len(content or b"")})
             continue
         try:
-            s = score_one_image(content)
-        except Exception:
-            s = None
+            s, diag = score_one_image(content)
+        except Exception as e:
+            s, diag = None, {"exception": f"{type(e).__name__}: {e}"}
+
         if s is None:
             skipped += 1
+            per_photo_debug.append({"photo": i, "error": "no_score", **diag})
         else:
             scores.append(s)
+            per_photo_debug.append({"photo": i, "score": s, **diag})
 
     if not scores:
         raise HTTPException(
             status_code=400,
-            detail={"error": "no_face_detected", "photos_received": len(photos)},
+            detail={
+                "error": "no_face_detected",
+                "photos_received": len(photos),
+                "debug": per_photo_debug,
+            },
         )
 
     final_score = sum(scores) / len(scores)
@@ -182,4 +226,5 @@ async def score_upload(photos: List[UploadFile] = File(...)):
         "score_0_100": round(final_score, 2),
         "photos_scored": len(scores),
         "photos_skipped": skipped,
+        "debug": per_photo_debug,
     }
