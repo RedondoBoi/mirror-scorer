@@ -5,7 +5,8 @@ python-multipart==0.0.20
 pillow==10.2.0
 numpy==1.26.4
 mediapipe==0.10.21
-torch==2.5.1+cpu
+torch==2.2.2+cpu
+torchvision==0.17.2+cpu
 transformers==4.46.3
 safetensors==0.4.5
 facenet-pytorch==2.6.0
