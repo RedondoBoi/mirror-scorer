@@ -8,3 +8,4 @@ mediapipe==0.10.21
 torch==2.5.1+cpu
 transformers==4.46.3
 safetensors==0.4.5
+facenet-pytorch==2.6.0

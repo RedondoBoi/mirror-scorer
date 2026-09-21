@@ -11,6 +11,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 import mediapipe as mp
 from transformers import AutoImageProcessor, MobileNetV2ForImageClassification
+from facenet_pytorch import InceptionResnetV1
 
 BaseOptions = mp.tasks.BaseOptions
 FaceDetector = mp.tasks.vision.FaceDetector
@@ -58,6 +59,14 @@ LABEL_VALUES = {
 _face_detector = None
 _beauty_model = None
 _beauty_processor = None
+_face_embedder = None
+
+# Starting threshold for "same person" on L2 distance between embeddings —
+# this is a commonly-cited starting point for this exact model, not
+# something we've tuned on our own data. Expect to revisit once real users
+# have gone through this — lighting, angle, and glasses all shift the
+# distance even for genuine matches.
+VERIFICATION_DISTANCE_THRESHOLD = 1.0
 
 
 def _ensure_cached(url: str, path: str):
@@ -86,6 +95,34 @@ def get_beauty_model():
         _beauty_model = MobileNetV2ForImageClassification.from_pretrained(BEAUTY_MODEL_REPO)
         _beauty_model.eval()
     return _beauty_model, _beauty_processor
+
+
+def get_face_embedder():
+    global _face_embedder
+    if _face_embedder is None:
+        _face_embedder = InceptionResnetV1(pretrained="vggface2").eval()
+    return _face_embedder
+
+
+def _face_embedding(face_img: Image.Image) -> torch.Tensor:
+    """Turns a cropped face into a 512-number embedding, using this model's
+    documented preprocessing convention (160x160, fixed_image_standardization)."""
+    resized = face_img.resize((160, 160))
+    arr = np.asarray(resized).astype(np.float32)
+    # This specific formula (not ImageNet mean/std) is what this model's
+    # pretrained weights expect — it's the library's own "prewhitening" step.
+    arr = (arr - 127.5) / 128.0
+    arr = arr.transpose(2, 0, 1)  # HWC -> CHW
+    tensor = torch.from_numpy(arr).unsqueeze(0)
+
+    model = get_face_embedder()
+    with torch.no_grad():
+        embedding = model(tensor)
+    return embedding[0]
+
+
+def _l2_distance(a: torch.Tensor, b: torch.Tensor) -> float:
+    return (a - b).norm().item()
 
 
 def _crop_face(pil_img: Image.Image, bbox) -> Image.Image:
@@ -129,7 +166,9 @@ def _score_face_crop(face_img: Image.Image) -> float:
     return total / weight_sum
 
 
-def score_one_image(image_bytes: bytes):
+def _load_and_crop_face(image_bytes: bytes):
+    """Loads an image, corrects EXIF rotation, detects the largest face, and
+    returns (face_crop, diag) — face_crop is None if no face was found."""
     pil_img = Image.open(io.BytesIO(image_bytes))
     # Phone photos carry an EXIF rotation tag rather than storing pixels
     # already rotated — without this, a sideways/upside-down image gets fed
@@ -157,6 +196,13 @@ def score_one_image(image_bytes: bytes):
     )
 
     face_img = _crop_face(pil_img, best.bounding_box)
+    return face_img, diag
+
+
+def score_one_image(image_bytes: bytes):
+    face_img, diag = _load_and_crop_face(image_bytes)
+    if face_img is None:
+        return None, diag
 
     raw_1_5 = _score_face_crop(face_img)
     raw_1_5 = max(1.0, min(5.0, raw_1_5))
@@ -187,12 +233,65 @@ def debug_models():
         info["beauty_model_loaded"] = False
         info["beauty_model_error"] = f"{type(e).__name__}: {e}"
 
+    try:
+        get_face_embedder()
+        info["face_embedder_loaded"] = True
+    except Exception as e:
+        info["face_embedder_loaded"] = False
+        info["face_embedder_error"] = f"{type(e).__name__}: {e}"
+
     if os.path.exists(FACE_DETECTOR_PATH):
         info["face_detector_file"] = {"exists": True, "bytes": os.path.getsize(FACE_DETECTOR_PATH)}
     else:
         info["face_detector_file"] = {"exists": False}
 
     return info
+
+
+@app.post("/verify_selfie")
+async def verify_selfie(selfie: UploadFile = File(...), photos: List[UploadFile] = File(...)):
+    """Checks whether the live selfie matches the face in each scoring
+    photo. This is meant to run BEFORE scoring — a real identity gate, not
+    an informational check."""
+    selfie_bytes = await selfie.read()
+    if not selfie_bytes or len(selfie_bytes) < 500:
+        raise HTTPException(status_code=400, detail={"error": "selfie_too_small"})
+
+    selfie_face, selfie_diag = _load_and_crop_face(selfie_bytes)
+    if selfie_face is None:
+        raise HTTPException(status_code=400, detail={"error": "no_face_in_selfie", "debug": selfie_diag})
+
+    selfie_embedding = _face_embedding(selfie_face)
+
+    per_photo = []
+    any_match = False
+
+    for i, photo in enumerate(photos):
+        content = await photo.read()
+        if not content or len(content) < 500:
+            per_photo.append({"photo": i, "error": "file_too_small"})
+            continue
+
+        face, diag = _load_and_crop_face(content)
+        if face is None:
+            per_photo.append({"photo": i, "error": "no_face_detected", **diag})
+            continue
+
+        embedding = _face_embedding(face)
+        distance = _l2_distance(selfie_embedding, embedding)
+        match = distance < VERIFICATION_DISTANCE_THRESHOLD
+
+        if match:
+            any_match = True
+
+        per_photo.append({"photo": i, "distance": round(distance, 4), "match": match})
+
+    return {
+        "ok": True,
+        "verified": any_match,
+        "threshold": VERIFICATION_DISTANCE_THRESHOLD,
+        "per_photo": per_photo,
+    }
 
 
 @app.post("/score_upload")
