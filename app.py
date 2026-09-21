@@ -5,6 +5,11 @@ from typing import List
 
 import numpy as np
 import torch
+
+# A single CPU thread uses meaningfully less memory than torch's default
+# (which tries to use all available cores) — worth it on a memory-constrained
+# instance even though it costs a little speed.
+torch.set_num_threads(1)
 from PIL import Image, ImageOps
 from fastapi import FastAPI, File, UploadFile, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -100,7 +105,11 @@ def get_beauty_model():
 def get_face_embedder():
     global _face_embedder
     if _face_embedder is None:
-        _face_embedder = InceptionResnetV1(pretrained="vggface2").eval()
+        # Half precision roughly halves this model's memory footprint
+        # (107MB -> ~53MB) — worth it given how memory-constrained this
+        # instance is. Basic conv/batchnorm/linear ops used here are
+        # well-supported in fp16 on CPU.
+        _face_embedder = InceptionResnetV1(pretrained="vggface2").eval().half()
     return _face_embedder
 
 
@@ -113,12 +122,12 @@ def _face_embedding(face_img: Image.Image) -> torch.Tensor:
     # pretrained weights expect — it's the library's own "prewhitening" step.
     arr = (arr - 127.5) / 128.0
     arr = arr.transpose(2, 0, 1)  # HWC -> CHW
-    tensor = torch.from_numpy(arr).unsqueeze(0)
+    tensor = torch.from_numpy(arr).unsqueeze(0).half()
 
     model = get_face_embedder()
     with torch.no_grad():
         embedding = model(tensor)
-    return embedding[0]
+    return embedding[0].float()
 
 
 def _l2_distance(a: torch.Tensor, b: torch.Tensor) -> float:
